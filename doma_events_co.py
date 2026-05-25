@@ -433,7 +433,7 @@ def _coerce_non_negative_price(value: Any) -> Optional[float]:
 
 
 # REPLACE HERE: Strict target TLD domain validator module
-def _sanitize_strict_com_domain(raw_domain: Any) -> str:
+def _sanitize_strict_tld_domain(raw_domain: Any) -> str:
     """
     Strictly validate and normalize a domain with exactly one target TLD extension.
 
@@ -541,7 +541,7 @@ def _is_premium_domain_item(item: dict[str, Any]) -> bool:
 
 
 def _find_domain_object_for_query(payload: Any, domain_name: str) -> Optional[dict[str, Any]]:
-    normalized_query = _sanitize_strict_com_domain(domain_name) or str(domain_name or "").strip().lower()
+    normalized_query = _sanitize_strict_tld_domain(domain_name) or str(domain_name or "").strip().lower()
     if not normalized_query:
         return None
 
@@ -556,7 +556,7 @@ def _find_domain_object_for_query(payload: Any, domain_name: str) -> Optional[di
             candidate_items = [payload]
 
     for item in candidate_items:
-        item_domain = _sanitize_strict_com_domain(_parse_item_domain(item)) or _parse_item_domain(item)
+        item_domain = _sanitize_strict_tld_domain(_parse_item_domain(item)) or _parse_item_domain(item)
         if item_domain and item_domain.lower() == normalized_query:
             return item
     return None
@@ -992,8 +992,8 @@ def _parse_domain_item(item: dict, fallback_domain: str) -> Optional["DomainOppo
       - Domain is a strict target-TLD format with exactly one extension.
       - Price is extracted deterministically via extract_spaceship_price.
     """
-    fallback_sanitized = _sanitize_strict_com_domain(fallback_domain)
-    item_sanitized = _sanitize_strict_com_domain(_parse_item_domain(item))
+    fallback_sanitized = _sanitize_strict_tld_domain(fallback_domain)
+    item_sanitized = _sanitize_strict_tld_domain(_parse_item_domain(item))
     normalized_domain = item_sanitized or fallback_sanitized
     if not normalized_domain:
         return None
@@ -1249,7 +1249,7 @@ async def check_domains_with_single_retry(
     """
     normalized_domains = []
     for raw_domain in domains:
-        sanitized_domain = _sanitize_strict_com_domain(raw_domain)
+        sanitized_domain = _sanitize_strict_tld_domain(raw_domain)
         if not sanitized_domain:
             LOGGER.warning("Skipping invalid domain before API call: %s", raw_domain)
             continue
@@ -1576,7 +1576,7 @@ async def fetch_spaceship_domains(app: Application) -> dict[str, int]:
                         continue
                     if store.has_alerted(fixed_chat_id, opportunity.domain):
                         continue
-                    sanitized_domain = _sanitize_strict_com_domain(opportunity.domain)
+                    sanitized_domain = _sanitize_strict_tld_domain(opportunity.domain)
                     if not sanitized_domain:
                         continue
                     final_verified_price = opportunity.ask_price_usd
