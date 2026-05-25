@@ -433,7 +433,7 @@ def _coerce_non_negative_price(value: Any) -> Optional[float]:
 
 
 # REPLACE HERE: Strict target TLD domain validator module
-def _sanitize_strict_tld_domain(raw_domain: Any) -> str:
+def _sanitize_strict_tld_domain(raw_domain: Any, *, tld: str = PRIMARY_TLD) -> str:
     """
     Strictly validate and normalize a domain with exactly one target TLD extension.
 
@@ -448,7 +448,7 @@ def _sanitize_strict_tld_domain(raw_domain: Any) -> str:
         return ""
     if any(ch.isspace() for ch in clean_domain):
         return ""
-    strict_tld = _normalize_tld(PRIMARY_TLD)
+    strict_tld = _normalize_tld(tld)
     if not strict_tld:
         return ""
     if not clean_domain.endswith(strict_tld):
@@ -1227,9 +1227,9 @@ def load_processed_available_domains() -> set[str]:
     return processed_domains
 
 
-def _base_keyword_from_domain(full_domain: str) -> str:
+def _base_keyword_from_domain(full_domain: str, *, tld: str = PRIMARY_TLD) -> str:
     clean_domain = str(full_domain or "").strip().lower()
-    strict_tld = _normalize_tld(PRIMARY_TLD)
+    strict_tld = _normalize_tld(tld)
     if strict_tld and clean_domain.endswith(strict_tld):
         return clean_domain.removesuffix(strict_tld)
     return clean_domain.split(".", 1)[0] if "." in clean_domain else clean_domain
