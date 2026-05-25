@@ -1,0 +1,1675 @@
+import asyncio
+import csv
+import html
+import logging
+import os
+import random
+import re
+import sqlite3
+import threading
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Optional
+
+import aiohttp
+from telegram import InlineKeyboardMarkup, InputFile
+from telegram.error import RetryAfter, TelegramError
+from telegram.ext import Application
+
+from vip_database import VipRecord, get_vip_database
+
+LOGGER = logging.getLogger(__name__)
+
+# ─── Tuning constants ────────────────────────────────────────────────────────
+MAIN_CHAT_ID = -1003736596502
+# Strict .com mode: all available alerts are routed to the fixed topic below.
+TELEGRAM_TOPIC_ID = 33361
+PRIORITY_TLDS = frozenset({".com"})
+
+MIN_POLL_SECONDS = 1
+MIN_QUOTA_COOLDOWN_SECONDS = 30
+MIN_CIRCUIT_BREAKER_SECONDS = 30
+DEFAULT_FALLBACK_ASK_PRICE_USD = 10.0
+WATCHER_ERROR_RETRY_SECONDS = 5
+TARGET_TLDS = {".com"}
+PROCESSED_STATUS_AVAILABLE = "Available"
+PROCESSED_STATUS_TAKEN = "Taken"
+PROCESSED_STATUS_ERROR = "Error"
+PROCESSED_STATUS_ALLOWED = {
+    PROCESSED_STATUS_AVAILABLE,
+    PROCESSED_STATUS_TAKEN,
+    PROCESSED_STATUS_ERROR,
+}
+PROCESSED_CSV_HEADER_ROW_INDEX = 0
+PROCESSED_CSV_DEFAULT_DOMAIN_COLUMN_INDEX = 1
+PROCESSED_CSV_MIN_COLUMNS = 2
+PROCESSED_CSV_HEADER_KEYWORD = "keyword"
+PROCESSED_CSV_DOMAIN_HEADERS = ("full_domain", "domain")
+PROCESSED_CSV_STATUS_HEADERS = ("status",)
+MAX_SUITABLE_PRICE_USD = 50.00
+PREMIUM_PRICE_PATHS: tuple[tuple[str, ...], ...] = (
+    ("pricing", "premium", "registerPrice", "amount"),
+    ("pricing", "premium", "registerPrice", "value"),
+    ("pricing", "premium", "registerPrice", "price"),
+    ("pricing", "premium", "registerPrice", "usd"),
+    ("pricing", "premium", "register"),
+    ("pricing", "premium", "registerPrice"),
+    ("pricing", "premium", "registrationPrice", "amount"),
+    ("pricing", "premium", "registrationPrice", "value"),
+    ("pricing", "premium", "registrationPrice", "price"),
+    ("pricing", "premium", "registrationPrice", "usd"),
+    ("pricing", "premium", "registration"),
+    ("pricing", "premium", "registrationPrice"),
+    ("pricing", "premium", "price", "amount"),
+    ("pricing", "premium", "price", "value"),
+    ("pricing", "premium", "price", "usd"),
+    ("pricing", "premium", "price"),
+    ("pricing", "premium", "amount"),
+    ("pricing", "premium", "cost"),
+    ("pricing", "premium", "value"),
+    ("premiumPrice",),
+    ("premium", "register", "amount"),
+    ("premium", "register", "value"),
+    ("premium", "register", "price"),
+    ("premium", "register"),
+    ("premium", "registerPrice"),
+    ("premium", "registrationPrice", "amount"),
+    ("premium", "registrationPrice", "value"),
+    ("premium", "registrationPrice", "price"),
+    ("premium", "registration"),
+    ("premium", "registrationPrice"),
+    ("premium", "price"),
+    ("premium", "amount"),
+    ("premium", "cost"),
+    ("premium", "value"),
+)
+STANDARD_PRICE_PATHS: tuple[tuple[str, ...], ...] = (
+    ("pricing", "standard", "registerPrice", "amount"),
+    ("pricing", "standard", "registerPrice", "value"),
+    ("pricing", "standard", "registerPrice", "price"),
+    ("pricing", "standard", "registerPrice", "usd"),
+    ("pricing", "standard", "register"),
+    ("pricing", "standard", "registerPrice"),
+    ("pricing", "standard", "registrationPrice", "amount"),
+    ("pricing", "standard", "registrationPrice", "value"),
+    ("pricing", "standard", "registrationPrice", "price"),
+    ("pricing", "standard", "registrationPrice", "usd"),
+    ("pricing", "standard", "registration"),
+    ("pricing", "standard", "registrationPrice"),
+    ("pricing", "standard", "price", "amount"),
+    ("pricing", "standard", "price", "value"),
+    ("pricing", "standard", "price", "usd"),
+    ("pricing", "standard", "price"),
+    ("pricing", "standard", "amount"),
+    ("pricing", "standard", "cost"),
+    ("pricing", "standard", "value"),
+    ("pricing", "registerPrice", "amount"),
+    ("pricing", "registerPrice", "value"),
+    ("pricing", "registerPrice", "price"),
+    ("pricing", "registerPrice", "usd"),
+    ("pricing", "register"),
+    ("pricing", "registerPrice"),
+    ("pricing", "registrationPrice", "amount"),
+    ("pricing", "registrationPrice", "value"),
+    ("pricing", "registrationPrice", "price"),
+    ("pricing", "registrationPrice", "usd"),
+    ("pricing", "registration"),
+    ("pricing", "registrationPrice"),
+    ("pricing", "price"),
+    ("price",),
+    ("registerPrice", "amount"),
+    ("registerPrice", "value"),
+    ("registerPrice", "price"),
+    ("registerPrice", "usd"),
+    ("registerPrice",),
+    ("registrationPrice", "amount"),
+    ("registrationPrice", "value"),
+    ("registrationPrice", "price"),
+    ("registrationPrice", "usd"),
+    ("registrationPrice",),
+    ("amount",),
+    ("cost",),
+    ("value",),
+)
+PREMIUM_FLAG_PATHS: tuple[tuple[str, ...], ...] = (
+    ("isPremium",),
+    ("premium",),
+    ("is_premium",),
+    ("pricing", "isPremium"),
+    ("pricing", "premium", "isPremium"),
+    ("pricing", "premium", "premium"),
+    ("pricing", "premium", "enabled"),
+    ("pricing", "premium", "flag"),
+    ("pricing", "premium", "isPremiumDomain"),
+)
+PREMIUM_TIER_PATHS: tuple[tuple[str, ...], ...] = (
+    ("tier",),
+    ("priceTier",),
+    ("pricing", "tier"),
+    ("pricing", "priceTier"),
+    ("pricing", "tierName"),
+    ("pricing", "tierLevel"),
+    ("pricing", "category"),
+    ("pricing", "premium", "tier"),
+    ("pricing", "premium", "priceTier"),
+    ("pricing", "premium", "tierName"),
+    ("pricing", "premium", "tierLevel"),
+    ("pricing", "premium", "category"),
+)
+# Weights are additive; higher totals win during fallback scoring, with higher prices breaking ties.
+# Explicit pricing keys are weighted higher than generic value-like fields.
+PRICE_FALLBACK_KEYWORD_SCORES: tuple[tuple[str, int], ...] = (
+    ("price", 6),
+    ("register", 5),
+    ("registration", 5),
+    ("amount", 4),
+    ("cost", 4),
+    ("fee", 3),
+    ("value", 2),
+    ("premium", 2),
+    ("sale", 1),
+    ("retail", 1),
+    ("renew", 1),
+    ("usd", 1),
+)
+
+# Spaceship-specific throttle / batch controls
+# ─ 2 s intra-batch delay as required; keep default 429-backoff seed here too
+SPACESHIP_INTRA_BATCH_DELAY_SECONDS = 2
+SPACESHIP_BULK_BATCH_SIZE = 20          # Spaceship /domains/available max batch size
+SPACESHIP_API_SINGLE_RETRY_DELAY_SECONDS = 3
+SPACESHIP_API_MAX_ATTEMPTS = 4
+SPACESHIP_STUBBORN_RETRY_ATTEMPTS = 6
+SPACESHIP_STUBBORN_MAX_BACKOFF_SECONDS = 32
+DEFAULT_STATUS_EMOJI = "🟡"
+PRICE_VERIFICATION_FAILED_TEXT = "Verification Failed (Check Manually!)"
+PROCESSED_CSV_LOCK = threading.Lock()
+PROCESSED_CSV_PATH = Path(__file__).with_name("processed_domains.csv")
+
+
+class SpaceshipCircuitOpenError(Exception):
+    """Raised when Spaceship API calls are temporarily blocked by circuit breaker."""
+
+
+@dataclass(frozen=True)
+class DomainOpportunity:
+    """Represents one available domain result; ask_price_usd=None means price verification failed."""
+    domain: str
+    ask_price_usd: Optional[float]
+    domain_price: str
+    is_suitable: bool
+    source: str
+    listing_url: str
+    is_premium: bool = False
+    currency: str = "USD"
+    availability_status: str = "Available"
+
+    @property
+    def tld(self) -> str:
+        _, _, ext = self.domain.rpartition(".")
+        return f".{ext.lower()}" if ext else ""
+
+    @property
+    def sld(self) -> str:
+        return self.domain.split(".", 1)[0].lower()
+
+    @property
+    def whois_url(self) -> str:
+        return f"https://www.whois.com/whois/{self.domain}"
+
+
+@dataclass
+class WatcherConfig:
+    poll_seconds: int = 30
+    eco_poll_seconds: int = 120
+    turbo_poll_seconds: int = 8
+    turbo_hours_utc: tuple[tuple[int, int], ...] = ((18, 21),)
+    request_timeout_seconds: int = 20
+    db_path: str = "alerts.db"
+    max_domains_per_cycle: int = 200
+    quota_cooldown_seconds: int = 180
+    circuit_breaker_failure_threshold: int = 4
+    circuit_breaker_open_seconds: int = 120
+    allowed_tlds: set[str] = field(default_factory=lambda: {".com", ".ai", ".dev"})
+    high_value_keywords: set[str] = field(
+        default_factory=lambda: {
+            "ai",
+            "crypto",
+            "cloud",
+            "data",
+            "dev",
+            "app",
+            "bot",
+            "pay",
+            "trade",
+            "labs",
+        }
+    )
+    # ── Spaceship API credentials ──────────────────────────────────────────────
+    # Authentication: Spaceship uses a two-part Key + Secret scheme.
+    # Both are passed as individual HTTP headers on every request:
+    #   X-Api-Key:    <spaceship_api_key>
+    #   X-Api-Secret: <spaceship_api_secret>
+    spaceship_api_base_url: str = "https://spaceship.dev/api/v1"
+    spaceship_api_key: str = ""
+    spaceship_api_secret: str = ""
+    proxy_url: str = ""
+    human_delay_min_seconds: float = 0.8
+    human_delay_max_seconds: float = 2.5
+
+    @classmethod
+    def from_env(cls) -> "WatcherConfig":
+        human_delay_min = float(os.getenv("HUMAN_DELAY_MIN_SECONDS", "0.8"))
+        human_delay_max = float(os.getenv("HUMAN_DELAY_MAX_SECONDS", "2.5"))
+        delay_min = min(human_delay_min, human_delay_max)
+        delay_max = max(human_delay_min, human_delay_max)
+
+        raw_high_value_keywords = os.getenv(
+            "HIGH_VALUE_KEYWORDS",
+            "ai,crypto,cloud,data,dev,app,bot,pay,trade,labs",
+        )
+        high_value_keywords = {kw.strip().lower() for kw in raw_high_value_keywords.split(",") if kw.strip()}
+        return cls(
+            poll_seconds=int(os.getenv("WATCHER_POLL_SECONDS", "30")),
+            eco_poll_seconds=int(os.getenv("ECO_POLL_SECONDS", "120")),
+            turbo_poll_seconds=int(os.getenv("TURBO_POLL_SECONDS", "8")),
+            turbo_hours_utc=parse_turbo_hours(os.getenv("TURBO_HOURS_UTC", "18-21")),
+            request_timeout_seconds=int(os.getenv("HTTP_TIMEOUT_SECONDS", "20")),
+            db_path=os.getenv("ALERT_DB_PATH", "alerts.db"),
+            max_domains_per_cycle=int(os.getenv("MAX_DOMAINS_PER_CYCLE", "200")),
+            quota_cooldown_seconds=max(MIN_QUOTA_COOLDOWN_SECONDS, int(os.getenv("QUOTA_COOLDOWN_SECONDS", "180"))),
+            circuit_breaker_failure_threshold=max(2, int(os.getenv("CIRCUIT_BREAKER_FAILURE_THRESHOLD", "4"))),
+            circuit_breaker_open_seconds=max(
+                MIN_CIRCUIT_BREAKER_SECONDS,
+                int(os.getenv("CIRCUIT_BREAKER_OPEN_SECONDS", "120")),
+            ),
+            allowed_tlds=set(TARGET_TLDS),
+            high_value_keywords=high_value_keywords
+            or {"ai", "crypto", "cloud", "data", "dev", "app", "bot", "pay", "trade", "labs"},
+            spaceship_api_base_url=os.getenv("SPACESHIP_API_BASE_URL", "https://spaceship.dev/api/v1").strip() or "https://spaceship.dev/api/v1",
+            spaceship_api_key=os.getenv("SPACESHIP_API_KEY", "").strip(),
+            spaceship_api_secret=os.getenv("SPACESHIP_API_SECRET", "").strip(),
+            proxy_url=os.getenv("PROXY_URL", "").strip(),
+            human_delay_min_seconds=delay_min,
+            human_delay_max_seconds=delay_max,
+        )
+
+
+def parse_turbo_hours(raw_value: str) -> tuple[tuple[int, int], ...]:
+    ranges: list[tuple[int, int]] = []
+    for part in raw_value.split(","):
+        range_text = part.strip()
+        if not range_text:
+            continue
+        if "-" not in range_text:
+            LOGGER.warning("Ignoring invalid TURBO_HOURS_UTC range (missing '-'): %s", range_text)
+            continue
+        start_s, end_s = range_text.split("-", 1)
+        try:
+            start = int(start_s)
+            end = int(end_s)
+        except ValueError:
+            LOGGER.warning("Ignoring invalid TURBO_HOURS_UTC range (non-integer): %s", range_text)
+            continue
+        if 0 <= start <= 23 and 0 <= end <= 23:
+            if start == end:
+                end = (start + 1) % 24
+            ranges.append((start, end))
+        else:
+            LOGGER.warning("Ignoring invalid TURBO_HOURS_UTC range (out of bounds): %s", range_text)
+    return tuple(ranges) if ranges else ((18, 21),)
+
+
+def is_turbo_hour(now_utc: datetime, cfg: WatcherConfig) -> bool:
+    hour = now_utc.hour
+    for start, end in cfg.turbo_hours_utc:
+        if start < end and start <= hour < end:
+            return True
+        if start > end and (hour >= start or hour < end):
+            return True
+    return False
+
+
+def current_poll_seconds(now_utc: datetime, cfg: WatcherConfig) -> int:
+    if is_turbo_hour(now_utc, cfg):
+        return max(MIN_POLL_SECONDS, cfg.turbo_poll_seconds)
+    if cfg.eco_poll_seconds > 0:
+        return cfg.eco_poll_seconds
+    return cfg.poll_seconds
+
+
+class AlertStore:
+    def __init__(self, db_path: str) -> None:
+        self.conn = sqlite3.connect(db_path)
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sent_alerts (
+                chat_id INTEGER NOT NULL,
+                domain TEXT NOT NULL,
+                source TEXT NOT NULL,
+                first_seen_utc TEXT NOT NULL,
+                PRIMARY KEY (chat_id, domain)
+            )
+            """
+        )
+        self.conn.commit()
+
+    def has_alerted(self, chat_id: int, domain: str) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM sent_alerts WHERE chat_id = ? AND domain = ?",
+            (chat_id, domain.lower()),
+        ).fetchone()
+        return row is not None
+
+    def mark_alerted(self, chat_id: int, domain: str, source: str) -> None:
+        self.conn.execute(
+            """
+            INSERT OR IGNORE INTO sent_alerts(chat_id, domain, source, first_seen_utc)
+            VALUES (?, ?, ?, ?)
+            """,
+            (chat_id, domain.lower(), source, datetime.now(timezone.utc).isoformat()),
+        )
+        self.conn.commit()
+
+    def alerted_domains(self, chat_id: int) -> set[str]:
+        rows = self.conn.execute(
+            "SELECT domain FROM sent_alerts WHERE chat_id = ?",
+            (chat_id,),
+        ).fetchall()
+        return {
+            str(row[0]).strip().lower()
+            for row in rows
+            if row and isinstance(row[0], str) and row[0].strip()
+        }
+
+    def close(self) -> None:
+        self.conn.close()
+
+
+def validate_required_spaceship_config(cfg: WatcherConfig) -> None:
+    """Raise ValueError if mandatory Spaceship API credentials are absent."""
+    missing: list[str] = []
+    if not cfg.spaceship_api_key:
+        missing.append("SPACESHIP_API_KEY")
+    if not cfg.spaceship_api_secret:
+        missing.append("SPACESHIP_API_SECRET")
+    if missing:
+        missing_csv = ", ".join(missing)
+        raise ValueError(f"Missing required Spaceship configuration: {missing_csv}")
+
+
+def parse_float(value: Any) -> Optional[float]:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if re.search(r"[-−]\s*[0-9]", text):
+        return None
+    match = re.search(r"[0-9]+(?:\.[0-9]+)?", text.replace(",", ""))
+    if not match:
+        return None
+    try:
+        parsed = float(match.group(0))
+        if parsed < 0:
+            return None
+        return parsed
+    except ValueError:
+        return None
+
+
+def _coerce_non_negative_price(value: Any) -> Optional[float]:
+    parsed = parse_float(value)
+    if parsed is None or parsed < 0:
+        return None
+    return round(parsed, 2)
+
+
+# REPLACE HERE: Strict .com domain validator module
+def _sanitize_strict_com_domain(raw_domain: Any) -> str:
+    """
+    Strictly validate and normalize a domain with exactly one .com extension.
+
+    Rules:
+    - no whitespace
+    - exactly one trailing .com extension
+    - keyword contains only [a-z0-9-]
+    - keyword cannot start/end with '-'
+    """
+    clean_domain = str(raw_domain or "").strip().lower()
+    if not clean_domain:
+        return ""
+    if any(ch.isspace() for ch in clean_domain):
+        return ""
+    if not clean_domain.endswith(".com"):
+        return ""
+    if clean_domain.count(".com") != 1:
+        return ""
+    keyword = clean_domain[:-4]
+    if not keyword or "." in keyword:
+        return ""
+    if not re.fullmatch(r"[a-z0-9-]+", keyword):
+        return ""
+    if keyword.startswith("-") or keyword.endswith("-"):
+        return ""
+    return f"{keyword}.com"
+
+
+def _read_dict_path(node: dict[str, Any], path: tuple[str, ...]) -> Any:
+    current: Any = node
+    for key in path:
+        if not isinstance(current, dict) or key not in current:
+            return None
+        current = current[key]
+    return current
+
+
+def _is_truthy_premium_flag(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value > 0
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if not normalized:
+            return False
+        if normalized in {"true", "yes", "premium", "tiered", "1"}:
+            return True
+        if normalized in {"false", "no", "standard", "basic", "regular", "0"}:
+            return False
+        if "premium" in normalized:
+            return True
+    return False
+
+
+def _has_tier_token(normalized: str) -> bool:
+    tier_prefix = "tier"
+    if tier_prefix not in normalized:
+        return False
+    if normalized == "tiered":
+        return True
+    if len(normalized) > len(tier_prefix) and normalized.startswith(tier_prefix):
+        if normalized[len(tier_prefix):].isdigit():
+            return True
+    tokens = re.split(r"[\s_-]+", normalized)
+    return tier_prefix in tokens
+
+
+def _is_premium_tier_value(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value > 0
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if not normalized:
+            return False
+        if normalized in {"standard", "basic", "regular", "normal", "default", "base"}:
+            return False
+        if normalized in {"gold", "platinum", "diamond", "vip"}:
+            return True
+        if "premium" in normalized or _has_tier_token(normalized):
+            return True
+    return False
+
+
+def _is_premium_domain_item(item: dict[str, Any]) -> bool:
+    for path in PREMIUM_FLAG_PATHS:
+        flag_value = _read_dict_path(item, path)
+        if _is_truthy_premium_flag(flag_value):
+            return True
+    for path in PREMIUM_TIER_PATHS:
+        tier_value = _read_dict_path(item, path)
+        if _is_premium_tier_value(tier_value):
+            return True
+    premium_price = _extract_price_from_paths(item, PREMIUM_PRICE_PATHS)
+    if premium_price is not None:
+        standard_price = _extract_price_from_paths(item, STANDARD_PRICE_PATHS)
+        if standard_price is None:
+            return True
+    return False
+
+
+def _find_domain_object_for_query(payload: Any, domain_name: str) -> Optional[dict[str, Any]]:
+    normalized_query = _sanitize_strict_com_domain(domain_name) or str(domain_name or "").strip().lower()
+    if not normalized_query:
+        return None
+
+    candidate_items: list[dict[str, Any]] = []
+    if isinstance(payload, list):
+        candidate_items = [entry for entry in payload if isinstance(entry, dict)]
+    elif isinstance(payload, dict):
+        wrapped_results = _extract_results_list(payload)
+        if wrapped_results is not None:
+            candidate_items = [entry for entry in wrapped_results if isinstance(entry, dict)]
+        else:
+            candidate_items = [payload]
+
+    for item in candidate_items:
+        item_domain = _sanitize_strict_com_domain(_parse_item_domain(item)) or _parse_item_domain(item)
+        if item_domain and item_domain.lower() == normalized_query:
+            return item
+    return None
+
+
+def _extract_price_from_paths(item: dict[str, Any], paths: tuple[tuple[str, ...], ...]) -> Optional[float]:
+    """Read the first valid path in declared order; path order is the deterministic precedence."""
+    for path in paths:
+        parsed = _coerce_non_negative_price(_read_dict_path(item, path))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _score_price_key(key: Any) -> int:
+    if key is None or not isinstance(key, str):
+        return 0
+    normalized = key.strip().lower()
+    if not normalized:
+        return 0
+    score = 0
+    for token, weight in PRICE_FALLBACK_KEYWORD_SCORES:
+        if token in normalized:
+            score += weight
+    return score
+
+
+def _coerce_candidate_price(value: Any) -> Optional[float]:
+    """Return a parsed non-negative price, skipping booleans and invalid values."""
+    if isinstance(value, bool):
+        return None
+    return _coerce_non_negative_price(value)
+
+
+def _walk_price_candidates(
+    node: Any,
+    base_score: int,
+    candidates: list[tuple[int, float]],
+    numbers: list[float],
+) -> None:
+    if isinstance(node, dict):
+        for key, value in node.items():
+            key_score = _score_price_key(key)
+            combined_score = base_score + key_score
+            if isinstance(value, (dict, list)):
+                _walk_price_candidates(value, combined_score, candidates, numbers)
+            else:
+                parsed = _coerce_candidate_price(value)
+                if parsed is not None:
+                    numbers.append(parsed)
+                    if combined_score > 0:
+                        candidates.append((combined_score, parsed))
+    elif isinstance(node, list):
+        for value in node:
+            _walk_price_candidates(value, base_score, candidates, numbers)
+    else:
+        parsed = _coerce_candidate_price(node)
+        if parsed is not None:
+            numbers.append(parsed)
+            if base_score > 0:
+                candidates.append((base_score, parsed))
+
+
+def _collect_price_candidates(node: Any) -> tuple[list[tuple[int, float]], list[float]]:
+    """Collect scored price candidates and all numeric values from nested payloads."""
+    candidates: list[tuple[int, float]] = []
+    numbers: list[float] = []
+    _walk_price_candidates(node, 0, candidates, numbers)
+    return candidates, numbers
+
+
+def _extract_price_from_payload_fallback(payload: Any) -> Optional[float]:
+    """
+    Return the best-scored price via PRICE_FALLBACK_KEYWORD_SCORES; otherwise return the max numeric value, or None.
+    """
+    candidates, numbers = _collect_price_candidates(payload)
+    if candidates:
+        return max(candidates, key=lambda pair: (pair[0], pair[1]))[1]
+    if numbers:
+        return max(numbers)
+    return None
+
+
+# REPLACE HERE: Deterministic multi-layer Spaceship price extractor
+def extract_spaceship_price(
+    payload: Any,
+    domain_name: str,
+    is_premium: Optional[bool] = None,
+) -> Optional[float]:
+    """
+    Deterministic extractor:
+    1) match exact domain object,
+    2) resolve premium status,
+    3) read status-specific price paths (then alternate paths),
+    4) fallback recursive scan for any price-like field,
+    5) return None only if payload contains no numeric value.
+    """
+    item = _find_domain_object_for_query(payload, domain_name)
+    if item is None:
+        return _extract_price_from_payload_fallback(payload)
+
+    if is_premium is None:
+        is_premium = _is_premium_domain_item(item)
+    preferred_paths = PREMIUM_PRICE_PATHS if is_premium else STANDARD_PRICE_PATHS
+    secondary_paths = STANDARD_PRICE_PATHS if is_premium else PREMIUM_PRICE_PATHS
+
+    price = _extract_price_from_paths(item, preferred_paths)
+    if price is None:
+        price = _extract_price_from_paths(item, secondary_paths)
+    if price is not None:
+        return price
+    return _extract_price_from_payload_fallback(item)
+
+
+class SpaceshipClient:
+    """
+    Async HTTP client for the Spaceship Domain Availability API.
+
+    Authentication (two-part Key + Secret):
+    ─────────────────────────────────────────
+    Every request carries two custom headers:
+        X-Api-Key:    <SPACESHIP_API_KEY>
+        X-Api-Secret: <SPACESHIP_API_SECRET>
+
+    Bulk availability endpoint:
+        POST  {base_url}/domains/available
+        Body: {"domains": ["example.com", ...]}   (max 20 per call)
+
+    HTTP/transient handling:
+        - Every low-level HTTP request gets four attempts with fixed 3-second delay.
+        - Batch checks wrap this with a stubborn 6-attempt exponential retry loop.
+    """
+
+    def __init__(self, session: aiohttp.ClientSession, cfg: WatcherConfig) -> None:
+        self.session = session
+        self.cfg = cfg
+        self._base_url = cfg.spaceship_api_base_url.rstrip("/")
+        self._quota_backoff_until_monotonic = 0.0
+        self._circuit_failures = 0
+        self._circuit_open_until_monotonic = 0.0
+
+    # ── Auth & helpers ────────────────────────────────────────────────────────
+
+    def _headers(self) -> dict[str, str]:
+        """
+        Build Spaceship authentication headers.
+
+        Spaceship uses a two-part header scheme:
+            X-Api-Key:    your Spaceship API key
+            X-Api-Secret: your Spaceship API secret
+        Both values are available in your Spaceship account dashboard.
+        """
+        return {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "X-Api-Key": self.cfg.spaceship_api_key,
+            "X-Api-Secret": self.cfg.spaceship_api_secret,
+        }
+
+    async def _humanized_delay(self) -> None:
+        await asyncio.sleep(
+            random.uniform(
+                self.cfg.human_delay_min_seconds,
+                self.cfg.human_delay_max_seconds,
+            )
+        )
+
+    # ── Circuit-breaker & quota helpers ──────────────────────────────────────
+
+    def _note_rate_limit(self) -> None:
+        loop = asyncio.get_running_loop()
+        self._quota_backoff_until_monotonic = max(
+            self._quota_backoff_until_monotonic,
+            loop.time() + self.cfg.quota_cooldown_seconds,
+        )
+
+    def _note_retryable_failure(self) -> None:
+        loop = asyncio.get_running_loop()
+        self._circuit_failures += 1
+        if self._circuit_failures >= self.cfg.circuit_breaker_failure_threshold:
+            self._circuit_open_until_monotonic = max(
+                self._circuit_open_until_monotonic,
+                loop.time() + self.cfg.circuit_breaker_open_seconds,
+            )
+            self._circuit_failures = 0
+
+    def _note_success(self) -> None:
+        self._circuit_failures = 0
+
+    def circuit_open_remaining_seconds(self) -> int:
+        loop = asyncio.get_running_loop()
+        remaining = self._circuit_open_until_monotonic - loop.time()
+        return max(0, int(remaining))
+
+    def quota_backoff_remaining_seconds(self) -> int:
+        loop = asyncio.get_running_loop()
+        remaining = self._quota_backoff_until_monotonic - loop.time()
+        return max(0, int(remaining))
+
+    # ── Core request dispatcher ───────────────────────────────────────────────
+
+    async def _request_json_with_retry(
+        self,
+        method: str,
+        url: str,
+        *,
+        params: Optional[dict[str, Any]] = None,
+        json: Optional[Any] = None,
+        context_label: str,
+    ) -> Optional[Any]:
+        """
+        Send an HTTP request with exactly four attempts on transient failures.
+        """
+        if not url:
+            return None
+
+        circuit_wait = self.circuit_open_remaining_seconds()
+        if circuit_wait > 0:
+            raise SpaceshipCircuitOpenError(
+                f"{context_label} blocked by circuit breaker for {circuit_wait}s"
+            )
+
+        last_error: Optional[str] = None
+        for attempt in range(1, SPACESHIP_API_MAX_ATTEMPTS + 1):
+            is_last_attempt = attempt == SPACESHIP_API_MAX_ATTEMPTS
+            await self._humanized_delay()
+            try:
+                LOGGER.debug(">> Contacting Spaceship API: %s %s", method, url)
+                async with self.session.request(
+                    method,
+                    url,
+                    headers=self._headers(),
+                    params=params,
+                    json=json,
+                    proxy=self.cfg.proxy_url or None,
+                ) as response:
+                    body = await response.text()
+
+                    if response.status == 429:
+                        self._note_rate_limit()
+                        self._note_retryable_failure()
+                        if is_last_attempt:
+                            raise RuntimeError(f"{context_label} failed status=429 body={body[:300]}")
+                        LOGGER.warning(
+                            "%s rate-limited (429) on %s; pausing %.2fs before retry (attempt %s/%s)",
+                            context_label,
+                            url,
+                            SPACESHIP_API_SINGLE_RETRY_DELAY_SECONDS,
+                            attempt,
+                            SPACESHIP_API_MAX_ATTEMPTS,
+                        )
+                        await asyncio.sleep(SPACESHIP_API_SINGLE_RETRY_DELAY_SECONDS)
+                        continue
+
+                    if 500 <= response.status < 600:
+                        self._note_retryable_failure()
+                        if is_last_attempt:
+                            raise RuntimeError(
+                                f"{context_label} failed status={response.status} body={body[:300]}"
+                            )
+                        LOGGER.warning(
+                            "%s upstream status=%s; retrying in %.2fs (attempt %s/%s)",
+                            context_label,
+                            response.status,
+                            SPACESHIP_API_SINGLE_RETRY_DELAY_SECONDS,
+                            attempt,
+                            SPACESHIP_API_MAX_ATTEMPTS,
+                        )
+                        await asyncio.sleep(SPACESHIP_API_SINGLE_RETRY_DELAY_SECONDS)
+                        continue
+
+                    if response.status not in (200, 201):
+                        raise RuntimeError(
+                            f"{context_label} failed status={response.status} body={body[:300]}"
+                        )
+                        # Note: Spaceship returns 200 for availability checks.
+                        # 201 (Created) is accepted defensively for any future
+                        # Spaceship endpoint variants that follow REST conventions.
+
+                    try:
+                        payload = await response.json(content_type=None)
+                        self._note_success()
+                        return payload
+                    except Exception as exc:
+                        raise RuntimeError(
+                            f"{context_label} returned invalid JSON: {exc}"
+                        ) from exc
+
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+                self._note_retryable_failure()
+                if is_last_attempt:
+                    break
+                LOGGER.info(
+                    "%s network error: %s; retrying in %.2fs (attempt %s/%s)",
+                    context_label,
+                    exc,
+                    SPACESHIP_API_SINGLE_RETRY_DELAY_SECONDS,
+                    attempt,
+                    SPACESHIP_API_MAX_ATTEMPTS,
+                )
+                await asyncio.sleep(SPACESHIP_API_SINGLE_RETRY_DELAY_SECONDS)
+
+        if last_error:
+            raise RuntimeError(f"{context_label} failed after retries: {last_error}")
+        raise RuntimeError(f"{context_label} failed after retries")
+
+    # ── Domain availability ───────────────────────────────────────────────────
+
+    async def check_domain_availability(self, domain: str) -> Optional["DomainOpportunity"]:
+        """
+        Check a single domain's availability via the Spaceship API.
+
+        Endpoint: POST {base_url}/domains/available
+        Body:     {"domains": ["<domain>"]}
+        """
+        url = f"{self._base_url}/domains/available"
+        payload = await self._request_json_with_retry(
+            "POST",
+            url,
+            json={"domains": [domain]},
+            context_label="Spaceship Domain Availability",
+        )
+        results = _extract_results_list(payload)
+        if not results:
+            return None
+        item = results[0] if isinstance(results[0], dict) else None
+        if item is None:
+            return None
+        return _parse_domain_item(item, domain)
+
+    async def check_domains_availability_bulk(
+        self, domains: list[str]
+    ) -> tuple[list["DomainOpportunity"], int]:
+        """
+        Bulk-check up to SPACESHIP_BULK_BATCH_SIZE domains in a single POST.
+
+        Endpoint: POST {base_url}/domains/available
+        Body:     {"domains": ["d1.com", "d2.ai", ...]}
+
+        Returns (opportunities, failed_count).
+        """
+        if not domains:
+            return [], 0
+
+        url = f"{self._base_url}/domains/available"
+        payload = await self._request_json_with_retry(
+            "POST",
+            url,
+            json={"domains": domains},
+            context_label="Spaceship Domain Availability Bulk",
+        )
+
+        results = _extract_results_list(payload)
+        if results is None:
+            raise RuntimeError("Spaceship bulk availability returned unexpected payload format")
+
+        opportunities: list[DomainOpportunity] = []
+        failed_count = 0
+        normalized_input = {d.strip().lower() for d in domains if isinstance(d, str) and d.strip()}
+        seen_domains: set[str] = set()
+        status_by_domain: dict[str, str] = {}
+
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            normalized_domain = _parse_item_domain(item)
+            if normalized_domain:
+                seen_domains.add(normalized_domain)
+            is_available, status_text = _domain_status_from_item(item)
+            if normalized_domain:
+                status_by_domain[normalized_domain] = status_text
+            if not is_available:
+                if status_text.strip().lower() in {"unavailable", "tldnotsupported"}:
+                    LOGGER.info("Checked %s - Status: %s", normalized_domain or "N/A", status_text)
+                continue
+
+            if not normalized_domain or "." not in normalized_domain:
+                failed_count += 1
+                continue
+
+            opp = _parse_domain_item(item, normalized_domain)
+            if opp is not None:
+                status_by_domain[normalized_domain] = opp.availability_status or status_text
+                opportunities.append(opp)
+
+        if normalized_input:
+            missing = normalized_input.difference(seen_domains)
+            failed_count += len(missing)
+            for missing_domain in missing:
+                status_by_domain[missing_domain] = "No API Result"
+
+        if normalized_input:
+            for checked_domain in sorted(normalized_input):
+                if _is_priority_tld_domain(checked_domain):
+                    LOGGER.info(
+                        "[INFO] Checked %s - Status: %s",
+                        checked_domain,
+                        status_by_domain.get(checked_domain, "Unavailable"),
+                    )
+
+        return opportunities, failed_count
+
+
+def _extract_results_list(payload: Any) -> Optional[list]:
+    """
+    Normalise a Spaceship API response to a plain list of domain-result dicts.
+
+    Spaceship may return either:
+      - A top-level JSON array:  [{"domain": ..., "available": ...}, ...]
+      - A wrapped object with any of these keys:
+          "results"  – primary documented key
+          "domains"  – alternate documented key
+          "data"     – common REST envelope pattern
+          "items"    – common pagination envelope pattern
+    Returns None if no recognisable list structure is found.
+    """
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in ("results", "domains", "data", "items"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return value
+    return None
+
+
+def _parse_domain_item(item: dict, fallback_domain: str) -> Optional["DomainOpportunity"]:
+    """
+    Convert a single Spaceship domain-check result dict into a DomainOpportunity.
+
+    Domain and pricing are accepted when:
+      - Domain is a strict .com format with exactly one ".com" extension.
+      - Price is extracted deterministically via extract_spaceship_price.
+    """
+    fallback_sanitized = _sanitize_strict_com_domain(fallback_domain)
+    item_sanitized = _sanitize_strict_com_domain(_parse_item_domain(item))
+    normalized_domain = item_sanitized or fallback_sanitized
+    if not normalized_domain:
+        return None
+    if item_sanitized and fallback_sanitized and item_sanitized != fallback_sanitized:
+        LOGGER.warning(
+            "Dropping mismatched domain payload item=%s fallback=%s",
+            item_sanitized,
+            fallback_sanitized,
+        )
+        return None
+
+    is_premium = _is_premium_domain_item(item)
+    verified_price = extract_spaceship_price(item, normalized_domain, is_premium=is_premium)
+    ask_price = verified_price
+    if verified_price is None:
+        domain_price = PRICE_VERIFICATION_FAILED_TEXT
+    else:
+        domain_price = f"{verified_price:.2f}"
+
+    status_text = str(item.get("status") or "").strip() or "Available"
+    sanitized_domain = normalized_domain
+    buy_link = f"https://www.spaceship.com/domain-search/?query={sanitized_domain}"
+
+    return DomainOpportunity(
+        domain=normalized_domain,
+        ask_price_usd=ask_price,
+        domain_price=domain_price,
+        is_suitable=(ask_price is not None and ask_price <= MAX_SUITABLE_PRICE_USD),
+        is_premium=is_premium,
+        source="Spaceship Availability API",
+        listing_url=buy_link,
+        currency="USD",
+        availability_status=status_text,
+    )
+
+
+def _normalize_tld(value: str) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+    return raw if raw.startswith(".") else f".{raw}"
+
+
+def _effective_allowed_tlds() -> set[str]:
+    return set(TARGET_TLDS)
+
+
+def _is_priority_tld_domain(domain: str) -> bool:
+    clean = str(domain or "").strip().lower()
+    if "." not in clean:
+        return False
+    return f".{clean.rpartition('.')[-1]}" in PRIORITY_TLDS
+
+
+def _parse_item_domain(item: dict[str, Any]) -> str:
+    for key in ("domain", "domainName", "name", "fqdn"):
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip().lower()
+    sld = str(item.get("sld") or item.get("label") or "").strip().lower()
+    tld = _normalize_tld(str(item.get("tld") or item.get("zone") or "").strip().lower())
+    if sld and tld:
+        return f"{sld}{tld}"
+    return ""
+
+
+def _domain_status_from_item(item: dict[str, Any]) -> tuple[bool, str]:
+    available = item.get("available")
+    if isinstance(available, bool):
+        return available, "Available" if available else "Unavailable"
+
+    is_available = item.get("isAvailable")
+    if isinstance(is_available, bool):
+        return is_available, "Available" if is_available else "Unavailable"
+
+    is_registered = item.get("isRegistered")
+    if isinstance(is_registered, bool):
+        return (not is_registered), "Unavailable" if is_registered else "Available"
+
+    registered = item.get("registered")
+    if isinstance(registered, bool):
+        return (not registered), "Unavailable" if registered else "Available"
+
+    result = str(item.get("result") or "").strip().lower()
+    if result:
+        if result in {"available", "free", "open"}:
+            return True, "Available"
+        if result in {"unavailable", "registered", "taken", "reserved", "blocked"}:
+            LOGGER.info("Checked %s - Status: Unavailable", _parse_item_domain(item) or "N/A")
+            return False, "Unavailable"
+        if result == "tldnotsupported":
+            LOGGER.info("Checked %s - Status: Tldnotsupported", _parse_item_domain(item) or "N/A")
+            return False, "Tldnotsupported"
+        return False, result.title()
+
+    availability = str(item.get("availability") or "").strip().lower()
+    if availability:
+        if availability in {"available", "free", "open"}:
+            return True, "Available"
+        if availability in {"unavailable", "registered", "taken", "reserved", "blocked"}:
+            LOGGER.info("Checked %s - Status: Unavailable", _parse_item_domain(item) or "N/A")
+            return False, "Unavailable"
+        if availability == "tldnotsupported":
+            LOGGER.info("Checked %s - Status: Tldnotsupported", _parse_item_domain(item) or "N/A")
+            return False, "Tldnotsupported"
+        return False, availability.title()
+
+    status = str(item.get("status") or "").strip().lower()
+    if status:
+        if status in {"available", "free", "open"}:
+            return True, "Available"
+        if status in {"unavailable", "registered", "taken", "reserved", "blocked"}:
+            LOGGER.info("Checked %s - Status: Unavailable", _parse_item_domain(item) or "N/A")
+            return False, "Unavailable"
+        if status == "tldnotsupported":
+            LOGGER.info("Checked %s - Status: Tldnotsupported", _parse_item_domain(item) or "N/A")
+            return False, "Tldnotsupported"
+        return False, status.title()
+
+    return False, "Unavailable"
+
+
+def log_to_processed_csv(
+    base_keyword: str,
+    full_domain: str,
+    status: str,
+    price_usd: str = "N/A",
+) -> None:
+    """
+    Persist per-domain processing result to processed_domains.csv.
+
+    - Opens file in append mode.
+    - Auto-creates with header when absent.
+    - Status is constrained to: Available, Taken, Error.
+    - Price_USD records the verified price or a placeholder string (e.g., N/A).
+    """
+    normalized_status = status if status in PROCESSED_STATUS_ALLOWED else PROCESSED_STATUS_ERROR
+    output_path = PROCESSED_CSV_PATH
+
+    with PROCESSED_CSV_LOCK:
+        try:
+            file_is_empty = not output_path.exists() or output_path.stat().st_size == 0
+        except FileNotFoundError:
+            file_is_empty = True
+        with output_path.open("a", encoding="utf-8", newline="") as handle:
+            writer = csv.writer(handle)
+            if file_is_empty:
+                writer.writerow(["Keyword", "Full_Domain", "Status", "Price_USD"])
+            writer.writerow(
+                [
+                    str(base_keyword or "").strip(),
+                    str(full_domain or "").strip().lower(),
+                    normalized_status,
+                    str(price_usd or "").strip(),
+                ]
+            )
+
+
+def load_processed_available_domains() -> set[str]:
+    """
+    Load processed_domains.csv and return domains previously marked as Available.
+    If the status column is missing, processed memory is ignored to avoid skipping non-available domains.
+    """
+    output_path = PROCESSED_CSV_PATH
+    processed_domains: set[str] = set()
+    domain_column_index = PROCESSED_CSV_DEFAULT_DOMAIN_COLUMN_INDEX
+    status_column_index: Optional[int] = None
+    saw_header = False
+    available_status = PROCESSED_STATUS_AVAILABLE.lower()
+    if not output_path.exists():
+        return processed_domains
+    with PROCESSED_CSV_LOCK:
+        try:
+            with output_path.open("r", encoding="utf-8", newline="") as handle:
+                reader = csv.reader(handle)
+                for index, row in enumerate(reader):
+                    if not row:
+                        continue
+                    if index == PROCESSED_CSV_HEADER_ROW_INDEX:
+                        saw_header = True
+                        normalized_headers = [
+                            str(cell).strip().lower() if cell is not None else ""
+                            for cell in row
+                        ]
+                        header_domain_index = next(
+                            (
+                                normalized_headers.index(header)
+                                for header in PROCESSED_CSV_DOMAIN_HEADERS
+                                if header in normalized_headers
+                            ),
+                            None,
+                        )
+                        if header_domain_index is not None:
+                            domain_column_index = header_domain_index
+                            if PROCESSED_CSV_HEADER_KEYWORD not in normalized_headers:
+                                LOGGER.warning("Processed CSV header missing keyword column.")
+                        header_status_index = next(
+                            (
+                                normalized_headers.index(header)
+                                for header in PROCESSED_CSV_STATUS_HEADERS
+                                if header in normalized_headers
+                            ),
+                            None,
+                        )
+                        if header_status_index is not None:
+                            status_column_index = header_status_index
+                        else:
+                            LOGGER.warning(
+                                "Processed CSV header missing status column; skipping processed memory."
+                            )
+                            return processed_domains
+                        # Always skip the header row after parsing columns.
+                        continue
+                    min_columns_required = max(PROCESSED_CSV_MIN_COLUMNS, domain_column_index + 1)
+                    if len(row) < min_columns_required:
+                        continue
+                    domain = str(row[domain_column_index]).strip().lower()
+                    status_value: Optional[str] = None
+                    if status_column_index is not None and len(row) > status_column_index:
+                        status_value = str(row[status_column_index]).strip().lower()
+                    if status_value != available_status:
+                        continue
+                    if domain:
+                        processed_domains.add(domain)
+            if not saw_header:
+                LOGGER.warning("Processed CSV header row missing; skipping processed memory.")
+        except OSError as exc:
+            LOGGER.warning("Failed reading processed domain memory: %s", exc)
+        except csv.Error as exc:
+            LOGGER.warning("Malformed processed_domains.csv: %s", exc)
+    return processed_domains
+
+
+def _base_keyword_from_domain(full_domain: str) -> str:
+    clean_domain = str(full_domain or "").strip().lower()
+    if clean_domain.endswith(".com"):
+        return clean_domain.removesuffix(".com")
+    return clean_domain.split(".", 1)[0] if "." in clean_domain else clean_domain
+
+
+async def check_domains_with_single_retry(
+    client: "SpaceshipClient",
+    domains: list[str],
+) -> tuple[list["DomainOpportunity"], dict[str, str]]:
+    """
+    Check one batch with a stubborn 6-attempt wrapper retry policy.
+
+    Returns:
+      (available_opportunities, status_by_domain)
+    where status_by_domain values are strictly one of:
+      Available, Taken, Error.
+    """
+    normalized_domains = []
+    for raw_domain in domains:
+        sanitized_domain = _sanitize_strict_com_domain(raw_domain)
+        if not sanitized_domain:
+            LOGGER.warning("Skipping invalid domain before API call: %s", raw_domain)
+            continue
+        normalized_domains.append(sanitized_domain)
+    if not normalized_domains:
+        return [], {}
+
+    async def _run_once() -> tuple[list["DomainOpportunity"], dict[str, str]]:
+        opportunities, failed_count = await client.check_domains_availability_bulk(normalized_domains)
+        if failed_count:
+            LOGGER.info(
+                "Bulk availability returned %s unresolved results in batch_size=%s",
+                failed_count,
+                len(normalized_domains),
+            )
+        available_domains = {op.domain.strip().lower() for op in opportunities}
+        status_map = {
+            domain: (
+                PROCESSED_STATUS_AVAILABLE
+                if domain in available_domains
+                else PROCESSED_STATUS_TAKEN
+            )
+            for domain in normalized_domains
+        }
+        return opportunities, status_map
+
+    for attempt in range(1, SPACESHIP_STUBBORN_RETRY_ATTEMPTS + 1):
+        try:
+            return await _run_once()
+        except Exception as error:
+            if attempt >= SPACESHIP_STUBBORN_RETRY_ATTEMPTS:
+                LOGGER.error(
+                    "Domain check failed after %s stubborn attempts; batch_size=%s: %s",
+                    SPACESHIP_STUBBORN_RETRY_ATTEMPTS,
+                    len(normalized_domains),
+                    error,
+                )
+                break
+            backoff_seconds = min(2 ** attempt, SPACESHIP_STUBBORN_MAX_BACKOFF_SECONDS)
+            LOGGER.warning(
+                "Stubborn retry for batch_size=%s after attempt %s/%s; waiting %ss: %s",
+                len(normalized_domains),
+                attempt,
+                SPACESHIP_STUBBORN_RETRY_ATTEMPTS,
+                backoff_seconds,
+                error,
+            )
+            await asyncio.sleep(backoff_seconds)
+    return [], {domain: PROCESSED_STATUS_ERROR for domain in normalized_domains}
+
+
+def format_available_alert(
+    sanitized_domain: str,
+    final_verified_price: float,
+    buy_link: str,
+    pattern: str,
+    prefix: str,
+    is_premium: bool,
+) -> str:
+    clean_domain = html.escape(str(sanitized_domain or "").strip().lower())
+    clean_price = f"{final_verified_price:.2f}"
+    clean_link = html.escape(str(buy_link or "").strip(), quote=True)
+    clean_pattern = html.escape(str(pattern or "").strip())
+    clean_prefix = html.escape(str(prefix or "").strip())
+    premium_badge = " 💎 <b>[PREMIUM]</b>" if is_premium else ""
+    return (
+        f"🟢 <b>Domain:</b> {clean_domain}{premium_badge}\n"
+        f"🧬 <b>Pattern:</b> {clean_pattern}\n"
+        f"🔠 <b>Prefix:</b> {clean_prefix}\n"
+        f"💰 <b>Price:</b> ${clean_price}\n"
+        f"🛒 <b>Buy:</b> <a href=\"{clean_link}\">Open in Spaceship</a>"
+    )
+
+
+def format_verification_failed_alert(
+    sanitized_domain: str,
+    buy_link: str,
+    pattern: str,
+    prefix: str,
+    is_premium: bool,
+) -> str:
+    clean_domain = html.escape(str(sanitized_domain or "").strip().lower())
+    clean_link = html.escape(str(buy_link or "").strip(), quote=True)
+    clean_pattern = html.escape(str(pattern or "").strip())
+    clean_prefix = html.escape(str(prefix or "").strip())
+    premium_badge = " 💎 <b>[PREMIUM]</b>" if is_premium else ""
+    return (
+        f"🟡 <b>Domain:</b> {clean_domain}{premium_badge}\n"
+        f"🧬 <b>Pattern:</b> {clean_pattern}\n"
+        f"🔠 <b>Prefix:</b> {clean_prefix}\n"
+        f"💰 <b>Price:</b> ⚠️ {PRICE_VERIFICATION_FAILED_TEXT}\n"
+        f"🛒 <b>Buy:</b> <a href=\"{clean_link}\">Open in Spaceship</a>"
+    )
+
+
+async def send_telegram_notification(
+    app: Application,
+    domain_name: str,
+    text: str,
+    *,
+    parse_mode: str = "HTML",
+    reply_markup: InlineKeyboardMarkup | None = None,
+    disable_web_page_preview: bool = True,
+) -> None:
+    payload: dict[str, Any] = {
+        "chat_id": int(MAIN_CHAT_ID),
+        "text": text,
+        "parse_mode": parse_mode,
+        "disable_web_page_preview": disable_web_page_preview,
+        "message_thread_id": TELEGRAM_TOPIC_ID,
+    }
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
+
+    while True:
+        try:
+            await app.bot.send_message(**payload)
+            LOGGER.info(
+                "✅ VERIFIED: Telegram message sent for %s to topic=%s",
+                domain_name,
+                TELEGRAM_TOPIC_ID,
+            )
+            return
+        except RetryAfter as e:
+            await asyncio.sleep(e.retry_after)
+        except Exception as e:
+            LOGGER.error("❌ FAILED to send %s to Telegram topic %s: %s", domain_name, TELEGRAM_TOPIC_ID, e)
+            raise
+
+
+def build_candidate_domains(
+    vip_db: dict[str, VipRecord],
+    cfg: WatcherConfig,
+) -> tuple[list[str], dict[str, dict[str, str]]]:
+    """Build candidate domains from VIP roots and high-value keyword permutations across allowed TLDs."""
+    domains: set[str] = set()
+    metadata_by_domain: dict[str, dict[str, str]] = {}
+    effective_tlds = _effective_allowed_tlds()
+    for root, record in vip_db.items():
+        normalized_root = root.strip().lower()
+        if not normalized_root:
+            continue
+        for tld in effective_tlds:
+            domain = f"{normalized_root}{tld}"
+            domains.add(domain)
+            metadata_by_domain[domain] = {
+                "pattern": record.pattern,
+                "prefix": record.prefix,
+            }
+    for keyword in cfg.high_value_keywords:
+        for tld in effective_tlds:
+            domains.add(f"{keyword}{tld}")
+            domains.add(f"get{keyword}{tld}")
+            domains.add(f"my{keyword}{tld}")
+    return sorted(domains), metadata_by_domain
+
+
+def select_circular_batch(items: list[str], cursor: int, batch_size: int) -> tuple[list[str], int]:
+    """Return a circular batch and next cursor for stable round-robin scanning."""
+    if not items or batch_size <= 0:
+        return [], 0
+    start = cursor % len(items)
+    batch = [items[(start + idx) % len(items)] for idx in range(min(batch_size, len(items)))]
+    next_cursor = (start + len(batch)) % len(items)
+    return batch, next_cursor
+
+
+async def watch_events(app: Application) -> None:
+    cfg = WatcherConfig.from_env()
+    validate_required_spaceship_config(cfg)
+
+    LOGGER.info(
+        "Starting Spaceship watcher (default_poll=%ss, eco=%ss, turbo=%ss, turbo_hours=%s, api_base=%s, proxy=%s, delay=%.2f-%.2fs)",
+        cfg.poll_seconds,
+        cfg.eco_poll_seconds,
+        cfg.turbo_poll_seconds,
+        cfg.turbo_hours_utc,
+        cfg.spaceship_api_base_url,
+        bool(cfg.proxy_url),
+        cfg.human_delay_min_seconds,
+        cfg.human_delay_max_seconds,
+    )
+
+    while True:
+        if bool(app.bot_data.get("watcher_paused", False)):
+            await asyncio.sleep(1)
+            continue
+        now_utc = datetime.now(timezone.utc)
+        in_turbo = is_turbo_hour(now_utc, cfg)
+        poll_seconds = current_poll_seconds(now_utc, cfg)
+        try:
+            summary = await fetch_spaceship_domains(app)
+        except asyncio.CancelledError:
+            LOGGER.info("Spaceship watcher cancelled.")
+            raise
+        except Exception as exc:
+            LOGGER.exception("Spaceship watcher cycle failed: %s", exc)
+            await asyncio.sleep(WATCHER_ERROR_RETRY_SECONDS)
+            continue
+
+        next_wait = max(
+            poll_seconds,
+            int(summary.get("quota_wait_seconds", 0)),
+            int(summary.get("breaker_wait_seconds", 0)),
+        )
+        LOGGER.info(
+            "Cycle complete mode=%s checked=%s opportunities=%s next_poll=%ss quota_wait=%ss breaker_wait=%ss",
+            "turbo" if in_turbo else "eco",
+            int(summary.get("domains_checked", 0)),
+            int(summary.get("opportunities", 0)),
+            poll_seconds,
+            int(summary.get("quota_wait_seconds", 0)),
+            int(summary.get("breaker_wait_seconds", 0)),
+        )
+        resume_event = app.bot_data.get("watcher_resume_event")
+        if not isinstance(resume_event, asyncio.Event):
+            resume_event = asyncio.Event()
+            app.bot_data["watcher_resume_event"] = resume_event
+        try:
+            await asyncio.wait_for(resume_event.wait(), timeout=next_wait)
+            resume_event.clear()
+        except TimeoutError:
+            pass
+
+
+async def fetch_spaceship_domains(app: Application) -> dict[str, int]:
+    """
+    Run one full scan cycle against the Spaceship API.
+
+    Batching & anti-ban controls:
+    ──────────────────────────────
+    • Domains are chunked into batches of SPACESHIP_BULK_BATCH_SIZE (20).
+    • An asyncio.sleep(SPACESHIP_INTRA_BATCH_DELAY_SECONDS) pause is inserted
+      between every consecutive batch to simulate natural traffic patterns.
+    • Every low-level request gets up to 4 attempts with 3-second retry delay.
+    • Every batch check is wrapped by a 6-attempt stubborn retry loop (2s, 4s, 8s...).
+    """
+    cfg = WatcherConfig.from_env()
+    validate_required_spaceship_config(cfg)
+    timeout = aiohttp.ClientTimeout(total=cfg.request_timeout_seconds)
+    app.bot_data.setdefault("scan_cycle_counter", 0)
+    app.bot_data.setdefault(
+        "latest_scan_summary",
+        {"domains_checked": 0, "vip_matches": 0, "general_finds": 0},
+    )
+
+    store = AlertStore(cfg.db_path)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            client = SpaceshipClient(session, cfg)
+            vip_folder = Path(__file__).with_name("vip_data")
+            active_vip_db = get_vip_database(vip_folder)
+            candidate_domains, metadata_by_domain = build_candidate_domains(active_vip_db, cfg)
+            processed_domains = load_processed_available_domains()
+            already_alerted = store.alerted_domains(MAIN_CHAT_ID)
+            skip_domains = processed_domains | already_alerted
+            if skip_domains:
+                candidate_domains = [
+                    domain for domain in candidate_domains if domain not in skip_domains
+                ]
+            if not candidate_domains:
+                summary = {
+                    "domains_checked": 0,
+                    "vip_matches": 0,
+                    "general_finds": 0,
+                    "opportunities": 0,
+                    "api_blocked_failed": 0,
+                    "quota_wait_seconds": 0,
+                    "breaker_wait_seconds": 0,
+                }
+                app.bot_data["scan_cycle_counter"] = int(app.bot_data.get("scan_cycle_counter", 0)) + 1
+                app.bot_data["latest_scan_summary"] = summary
+                return summary
+
+            limit = min(cfg.max_domains_per_cycle, len(candidate_domains))
+            domain_cursor = int(app.bot_data.get("domain_cursor", 0))
+            selected_domains, next_cursor = select_circular_batch(
+                candidate_domains,
+                domain_cursor,
+                limit,
+            )
+            app.bot_data["domain_cursor"] = next_cursor
+            LOGGER.info("Fetching from Spaceship API: domains=%s", len(selected_domains))
+            com_count = sum(1 for d in selected_domains if d.endswith(".com"))
+            LOGGER.info("Priority coverage this cycle: .com=%s (total=%s)", com_count, len(selected_domains))
+            opportunities: list[DomainOpportunity] = []
+            api_blocked_failed = 0
+            for idx in range(0, len(selected_domains), SPACESHIP_BULK_BATCH_SIZE):
+                batch = selected_domains[idx : idx + SPACESHIP_BULK_BATCH_SIZE]
+                batch_opps, batch_statuses = await check_domains_with_single_retry(client, batch)
+                opportunities.extend(batch_opps)
+                price_by_domain = {
+                    opp.domain.strip().lower(): opp.domain_price for opp in batch_opps
+                }
+                for checked_domain in batch:
+                    clean_domain = str(checked_domain or "").strip().lower()
+                    if not clean_domain:
+                        continue
+                    base_keyword = _base_keyword_from_domain(clean_domain)
+                    status = batch_statuses.get(clean_domain, PROCESSED_STATUS_ERROR)
+                    price_usd = "N/A"
+                    if status == PROCESSED_STATUS_AVAILABLE:
+                        price_usd = price_by_domain.get(clean_domain, "N/A")
+                    log_to_processed_csv(base_keyword, clean_domain, status, price_usd)
+                    if status == PROCESSED_STATUS_ERROR:
+                        api_blocked_failed += 1
+                # Intra-batch delay: simulate natural traffic; required anti-ban measure
+                if idx + SPACESHIP_BULK_BATCH_SIZE < len(selected_domains):
+                    await asyncio.sleep(SPACESHIP_INTRA_BATCH_DELAY_SECONDS)
+            LOGGER.info("Fetched %s domains from Spaceship (available=%s)", len(selected_domains), len(opportunities))
+
+            vip_match_count = 0
+            general_match_count = 0
+            fixed_chat_id = MAIN_CHAT_ID
+            # REPLACE HERE: Zero-attrition Force-Catch routing matrix (Case A/B/C)
+            for opportunity in opportunities:
+                try:
+                    if opportunity.availability_status.strip().lower() != "available":
+                        continue
+                    if store.has_alerted(fixed_chat_id, opportunity.domain):
+                        continue
+                    sanitized_domain = _sanitize_strict_com_domain(opportunity.domain)
+                    if not sanitized_domain:
+                        continue
+                    final_verified_price = opportunity.ask_price_usd
+                    if final_verified_price is None:
+                        final_verified_price = _coerce_non_negative_price(opportunity.domain_price)
+                    # Standard (non-premium) domains without API prices use default standard pricing.
+                    # Premium domains missing prices are treated as verification failures.
+                    if final_verified_price is None and not opportunity.is_premium:
+                        final_verified_price = DEFAULT_FALLBACK_ASK_PRICE_USD
+                    if final_verified_price is None:
+                        buy_link = f"https://www.spaceship.com/domain-search/?query={sanitized_domain}"
+                        metadata = metadata_by_domain.get(sanitized_domain, {})
+                        pattern = metadata.get("pattern") or "N/A"
+                        prefix = metadata.get("prefix") or "N/A"
+                        await send_telegram_notification(
+                            app=app,
+                            domain_name=opportunity.domain,
+                            text=format_verification_failed_alert(
+                                sanitized_domain=sanitized_domain,
+                                buy_link=buy_link,
+                                pattern=pattern,
+                                prefix=prefix,
+                                is_premium=opportunity.is_premium,
+                            ),
+                            parse_mode="HTML",
+                            disable_web_page_preview=True,
+                        )
+                        store.mark_alerted(fixed_chat_id, opportunity.domain, opportunity.source)
+                        if opportunity.sld in active_vip_db:
+                            vip_match_count += 1
+                        else:
+                            general_match_count += 1
+                        LOGGER.info("Telegram send success domain=%s case=verification_failed", opportunity.domain)
+                        continue
+                    if final_verified_price > MAX_SUITABLE_PRICE_USD:
+                        LOGGER.info(
+                            "Dropping domain=%s reason=over_budget price=%.2f",
+                            opportunity.domain,
+                            final_verified_price,
+                        )
+                        continue
+                    buy_link = f"https://www.spaceship.com/domain-search/?query={sanitized_domain}"
+                    metadata = metadata_by_domain.get(sanitized_domain, {})
+                    pattern = metadata.get("pattern") or "N/A"
+                    prefix = metadata.get("prefix") or "N/A"
+                    await send_telegram_notification(
+                        app=app,
+                        domain_name=opportunity.domain,
+                        text=format_available_alert(
+                            sanitized_domain=sanitized_domain,
+                            final_verified_price=final_verified_price,
+                            buy_link=buy_link,
+                            pattern=pattern,
+                            prefix=prefix,
+                            is_premium=opportunity.is_premium,
+                        ),
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                    )
+                    store.mark_alerted(fixed_chat_id, opportunity.domain, opportunity.source)
+                    if opportunity.sld in active_vip_db:
+                        vip_match_count += 1
+                    else:
+                        general_match_count += 1
+                    LOGGER.info(
+                        "✅ VERIFIED: Telegram send success domain=%s price=%.2f pattern=%s",
+                        opportunity.domain,
+                        final_verified_price,
+                        pattern,
+                    )
+                except Exception as send_exc:
+                    LOGGER.exception("Telegram send failed domain=%s error=%s", opportunity.domain, send_exc)
+
+            summary = {
+                "domains_checked": len(selected_domains),
+                "vip_matches": vip_match_count,
+                "general_finds": general_match_count,
+                "opportunities": len(opportunities),
+                "api_blocked_failed": api_blocked_failed,
+                "quota_wait_seconds": client.quota_backoff_remaining_seconds(),
+                "breaker_wait_seconds": client.circuit_open_remaining_seconds(),
+            }
+            app.bot_data["scan_cycle_counter"] = int(app.bot_data.get("scan_cycle_counter", 0)) + 1
+            app.bot_data["latest_scan_summary"] = summary
+            try:
+                csv_payload = None
+                with PROCESSED_CSV_LOCK:
+                    if PROCESSED_CSV_PATH.exists() and PROCESSED_CSV_PATH.stat().st_size > 0:
+                        csv_payload = PROCESSED_CSV_PATH.read_bytes()
+                if csv_payload:
+                    document = InputFile(csv_payload, filename=PROCESSED_CSV_PATH.name)
+                    await app.bot.send_document(
+                        chat_id=int(MAIN_CHAT_ID),
+                        message_thread_id=TELEGRAM_TOPIC_ID,
+                        document=document,
+                    )
+                    LOGGER.info("Processed CSV sent to Telegram topic=%s", TELEGRAM_TOPIC_ID)
+                else:
+                    LOGGER.info("Processed CSV missing or empty; skipping Telegram upload.")
+            except (OSError, TelegramError):
+                LOGGER.exception(
+                    "Processed CSV upload failed path=%s chat_id=%s topic_id=%s",
+                    PROCESSED_CSV_PATH,
+                    MAIN_CHAT_ID,
+                    TELEGRAM_TOPIC_ID,
+                )
+            return summary
+    finally:
+        store.close()
