@@ -1223,7 +1223,7 @@ def load_processed_available_domains() -> set[str]:
         except OSError as exc:
             LOGGER.warning("Failed reading processed domain memory: %s", exc)
         except csv.Error as exc:
-            LOGGER.warning("Malformed processed_domains_co.csv: %s", exc)
+            LOGGER.warning("Malformed %s: %s", PROCESSED_CSV_FILENAME, exc)
     return processed_domains
 
 
